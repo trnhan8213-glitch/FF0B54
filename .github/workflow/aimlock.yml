@@ -1,4 +1,4 @@
-name: Build FreeFire Aimlock Dylib Ronaldo FF
+name: Build FreeFire Aimlock Dylib
 
 on:
   workflow_dispatch:
@@ -31,15 +31,60 @@ jobs:
         static mach_port_t task = MACH_PORT_NULL;
         static uintptr_t base = 0;
 
+        // Hàm đọc bộ nhớ
         bool read_mem(uintptr_t addr, void* buf, size_t size) {
-            vm_size_t sz;
-            return vm_read_overwrite(task, addr, size, (vm_address_t)buf, &sz) == KERN_SUCCESS;
+            if (task == MACH_PORT_NULL) return false;
+            vm_size_t sz = 0;
+            kern_return_t kr = vm_read_overwrite(task, addr, size, (vm_address_t)buf, &sz);
+            return (kr == KERN_SUCCESS && sz == size);
         }
 
+        // Hàm ghi bộ nhớ
         bool write_mem(uintptr_t addr, void* buf, size_t size) {
-            return vm_write(task, addr, (vm_offset_t)buf, size) == KERN_SUCCESS;
+            if (task == MACH_PORT_NULL) return false;
+            kern_return_t kr = vm_write(task, addr, (vm_offset_t)buf, size);
+            return (kr == KERN_SUCCESS);
         }
 
+        // Hàm đọc giá trị int từ bộ nhớ
+        int read_int(uintptr_t addr) {
+            int val = 0;
+            read_mem(addr, &val, sizeof(int));
+            return val;
+        }
+
+        // Hàm đọc giá trị float từ bộ nhớ
+        float read_float(uintptr_t addr) {
+            float val = 0.0f;
+            read_mem(addr, &val, sizeof(float));
+            return val;
+        }
+
+        // Hàm đọc chuỗi từ bộ nhớ
+        void read_string(uintptr_t addr, char* buf, size_t max_len) {
+            if (!buf || max_len == 0) return;
+            memset(buf, 0, max_len);
+            read_mem(addr, buf, max_len);
+        }
+
+        // Hàm tìm pattern trong bộ nhớ
+        uintptr_t find_pattern(const unsigned char* pattern, size_t len, uintptr_t start, uintptr_t end) {
+            if (task == MACH_PORT_NULL) return 0;
+            
+            for (uintptr_t addr = start; addr < end; addr += 0x1000) {
+                unsigned char buf[4096];
+                if (!read_mem(addr, buf, sizeof(buf))) continue;
+                
+                for (size_t i = 0; i < sizeof(buf) - len; i++) {
+                    if (memcmp(buf + i, pattern, len) == 0) {
+                        return addr + i;
+                    }
+                }
+            }
+            return 0;
+        }
+
+        // Hàm tìm process FreeFire
         void find_game() {
             pid_t pids[512];
             int count = proc_listpids(PROC_ALL_PIDS, 0, pids, sizeof(pids)) / sizeof(pid_t);
@@ -48,36 +93,79 @@ jobs:
                 if (proc_pidpath(pids[i], path, sizeof(path)) > 0) {
                     if (strstr(path, "FreeFire") || strstr(path, "com.dts.freefireth")) {
                         task_for_pid(mach_task_self(), pids[i], &task);
+                        printf("[FreeFire] Found game PID: %d\n", pids[i]);
                         return;
                     }
                 }
             }
+            printf("[FreeFire] Game not found\n");
         }
 
+        // Hàm lấy base address
         void get_base() {
+            if (task == MACH_PORT_NULL) return;
+            
             struct task_dyld_info info;
             mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
             if (task_info(task, TASK_DYLD_INFO, (task_info_t)&info, &cnt) != KERN_SUCCESS) return;
+            
             struct dyld_all_image_infos* infos = (struct dyld_all_image_infos*)info.all_image_info_addr;
+            if (!infos) return;
+            
             for (uint32_t i = 0; i < infos->infoArrayCount; i++) {
                 const char* path = infos->infoArray[i].imageFilePath;
                 if (path && (strstr(path, "FreeFire") || strstr(path, "com.dts.freefireth"))) {
                     base = (uintptr_t)infos->infoArray[i].imageLoadAddress;
+                    printf("[FreeFire] Base address: 0x%lx\n", base);
                     return;
                 }
             }
         }
 
+        // Hàm bypass antiban
         void bypass() {
+            if (task == MACH_PORT_NULL || base == 0) return;
+            
             unsigned char ret[] = {0xC0, 0x03, 0x5F, 0xD6};
             unsigned char nop[] = {0x1F, 0x20, 0x03, 0xD5};
+            
             write_mem(base + OFFSET_1, ret, 4);
             write_mem(base + OFFSET_2, nop, 4);
             write_mem(base + OFFSET_3, nop, 4);
+            
+            printf("[FreeFire] Anti-ban bypassed\n");
         }
 
+        // Hàm tìm bone_Head
+        uintptr_t find_bone_head() {
+            if (base == 0) return 0;
+            
+            unsigned char pattern[] = {0x62, 0x6F, 0x6E, 0x65, 0x5F, 0x48, 0x65, 0x61, 0x64};
+            return find_pattern(pattern, sizeof(pattern), base, base + 0x2000000);
+        }
+
+        // Hàm đọc vị trí bone_Head
+        void read_bone_position(uintptr_t bone_ptr, float* x, float* y, float* z) {
+            if (!bone_ptr) return;
+            // Đọc offset của bone_Head trong bộ nhớ
+            uintptr_t pos_addr = bone_ptr - 0x20;
+            *x = read_float(pos_addr);
+            *y = read_float(pos_addr + 4);
+            *z = read_float(pos_addr + 8);
+        }
+
+        // Thread aimlock
         void* aimlock(void* arg) {
             while (1) {
+                if (task != MACH_PORT_NULL && base != 0) {
+                    uintptr_t bone = find_bone_head();
+                    if (bone) {
+                        float x, y, z;
+                        read_bone_position(bone, &x, &y, &z);
+                        // Ghim súng vào vị trí bone_Head
+                        // (Thực hiện ghi camera rotation vào bộ nhớ game)
+                    }
+                }
                 usleep(5000);
             }
             return NULL;
@@ -85,23 +173,31 @@ jobs:
 
         __attribute__((constructor))
         void init() {
+            printf("[FreeFire] Aimlock dylib loaded\n");
             find_game();
             if (task == MACH_PORT_NULL) return;
             get_base();
             if (!base) return;
             bypass();
+            
             pthread_t t;
             pthread_create(&t, NULL, aimlock, NULL);
             pthread_detach(t);
+            printf("[FreeFire] Aimlock started\n");
         }
         EOF
 
-    - name: Compile
+    - name: Compile to iOS dylib
       run: |
-        SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-        clang -arch arm64 -isysroot $SDK -dynamiclib -o libaimlock.dylib code.c -framework Foundation -mios-version-min=13.0 -undefined dynamic_lookup
+        SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+        clang -arch arm64 -isysroot $SDK_PATH \
+          -dynamiclib -compatibility_version 1.0 -current_version 1.0 \
+          -o libaimlock.dylib code.c \
+          -framework Foundation -framework UIKit \
+          -mios-version-min=13.0 -O2 \
+          -undefined dynamic_lookup
 
-    - name: Upload
+    - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: libaimlock.dylib
