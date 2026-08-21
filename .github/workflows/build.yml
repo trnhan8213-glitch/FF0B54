@@ -31,8 +31,11 @@ jobs:
         #include <mach-o/loader.h>
         #include <mach-o/nlist.h>
         #include <mach/mach.h>
+        #include <mach/task.h>
+        #include <mach/vm_map.h>
         #include <TargetConditionals.h>
         #include <pthread.h>
+        #include <assert.h>
 
         // Bypass anti-ban
         #define BYPASS_ANTIBAN 1
@@ -42,48 +45,252 @@ jobs:
         #define OFFSET_2 0x000A8771
         #define OFFSET_3 0x001D4B8C
 
-        // Memory patching function
-        void patch_memory(void* addr, const unsigned char* data, size_t len) {
-            size_t page_size = getpagesize();
-            uintptr_t page_start = (uintptr_t)addr & ~(page_size - 1);
-            mprotect((void*)page_start, page_size, PROT_READ | PROT_WRITE | PROT_EXEC);
-            memcpy(addr, data, len);
-            mprotect((void*)page_start, page_size, PROT_READ | PROT_EXEC);
+        // Cấu trúc Vector3
+        typedef struct {
+            float x, y, z;
+        } Vector3;
+
+        // Biến toàn cục
+        static mach_port_t target_task = MACH_PORT_NULL;
+        static uintptr_t base_address = 0;
+        static bool aimlock_active = true;
+
+        // Hàm đọc bộ nhớ game
+        bool read_game_memory(uintptr_t address, void* buffer, size_t size) {
+            if (target_task == MACH_PORT_NULL) {
+                return false;
+            }
+            vm_size_t bytes_read = 0;
+            kern_return_t kr = vm_read_overwrite(target_task, address, size, (vm_address_t)buffer, &bytes_read);
+            return (kr == KERN_SUCCESS && bytes_read == size);
         }
 
-        // Aimlock implementation
-        void* aimlock_thread(void* arg) {
-            unsigned char nop[] = {0x1F, 0x20, 0x03, 0xD5};
-            unsigned char ret[] = {0xC0, 0x03, 0x5F, 0xD6};
+        // Hàm ghi bộ nhớ game
+        bool write_game_memory(uintptr_t address, const void* buffer, size_t size) {
+            if (target_task == MACH_PORT_NULL) {
+                return false;
+            }
+            kern_return_t kr = vm_write(target_task, address, (vm_offset_t)buffer, size);
+            return (kr == KERN_SUCCESS);
+        }
 
+        // Hàm tìm process FreeFire
+        bool find_freefire_process(void) {
+            pid_t pids[1024];
+            int num_pids = proc_listpids(PROC_ALL_PIDS, 0, pids, sizeof(pids));
+            if (num_pids <= 0) {
+                return false;
+            }
+            num_pids = num_pids / sizeof(pid_t);
+
+            for (int i = 0; i < num_pids; i++) {
+                if (pids[i] == 0) continue;
+                char path[PATH_MAX];
+                if (proc_pidpath(pids[i], path, sizeof(path)) <= 0) continue;
+
+                if (strstr(path, "FreeFire") != NULL ||
+                    strstr(path, "com.dts.freefireth") != NULL) {
+
+                    kern_return_t kr = task_for_pid(mach_task_self(), pids[i], &target_task);
+                    if (kr == KERN_SUCCESS) {
+                        printf("[FreeFire] Found process PID: %d\n", pids[i]);
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // Hàm tìm base address của game
+        uintptr_t find_base_address(void) {
+            if (target_task == MACH_PORT_NULL) {
+                return 0;
+            }
+
+            struct task_dyld_info dyld_info;
+            mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+            kern_return_t kr = task_info(target_task, TASK_DYLD_INFO, (task_info_t)&dyld_info, &count);
+            if (kr != KERN_SUCCESS) {
+                return 0;
+            }
+
+            struct dyld_all_image_infos* infos = (struct dyld_all_image_infos*)dyld_info.all_image_info_addr;
+            if (!infos) {
+                return 0;
+            }
+
+            for (uint32_t i = 0; i < infos->infoArrayCount; i++) {
+                const struct dyld_image_info* image = &infos->infoArray[i];
+                if (image->imageFilePath &&
+                    (strstr(image->imageFilePath, "FreeFire") != NULL ||
+                     strstr(image->imageFilePath, "com.dts.freefireth") != NULL)) {
+                    return (uintptr_t)image->imageLoadAddress;
+                }
+            }
+            return 0;
+        }
+
+        // Hàm tìm pattern trong bộ nhớ game
+        uintptr_t find_pattern_in_memory(const unsigned char* pattern, size_t pattern_len, uintptr_t start, uintptr_t end) {
+            if (target_task == MACH_PORT_NULL) {
+                return 0;
+            }
+
+            for (uintptr_t addr = start; addr < end; addr += 0x1000) {
+                unsigned char buffer[4096];
+                if (!read_game_memory(addr, buffer, sizeof(buffer))) {
+                    continue;
+                }
+
+                for (size_t i = 0; i < sizeof(buffer) - pattern_len; i++) {
+                    if (memcmp(buffer + i, pattern, pattern_len) == 0) {
+                        return addr + i;
+                    }
+                }
+            }
+            return 0;
+        }
+
+        // Hàm tìm bone_Head trong bộ nhớ
+        uintptr_t find_bone_head_in_memory(void) {
+            if (base_address == 0) {
+                return 0;
+            }
+
+            // Pattern "bone_Head"
+            unsigned char pattern[] = {0x62, 0x6F, 0x6E, 0x65, 0x5F, 0x48, 0x65, 0x61, 0x64};
+            uintptr_t start = base_address;
+            uintptr_t end = base_address + 0x2000000; // 32MB
+
+            return find_pattern_in_memory(pattern, sizeof(pattern), start, end);
+        }
+
+        // Hàm patch offset để bypass antiban
+        void bypass_antiban(void) {
+            if (target_task == MACH_PORT_NULL || base_address == 0) {
+                return;
+            }
+
+            // ARM64 RET instruction
+            unsigned char ret_inst[] = {0xC0, 0x03, 0x5F, 0xD6};
+            // ARM64 NOP instruction
+            unsigned char nop_inst[] = {0x1F, 0x20, 0x03, 0xD5};
+
+            // Patch offset 1: alcChatBubblePos -> RET
+            uintptr_t addr1 = base_address + OFFSET_1;
+            write_game_memory(addr1, ret_inst, sizeof(ret_inst));
+            printf("[FreeFire] Patched OFFSET_1 at 0x%lx\n", addr1);
+
+            // Patch offset 2: adComponent no find -> NOP + RET
+            uintptr_t addr2 = base_address + OFFSET_2;
+            write_game_memory(addr2, nop_inst, sizeof(nop_inst));
+            printf("[FreeFire] Patched OFFSET_2 at 0x%lx\n", addr2);
+
+            // Patch offset 3: boneWeights -> NOP
+            uintptr_t addr3 = base_address + OFFSET_3;
+            write_game_memory(addr3, nop_inst, sizeof(nop_inst));
+            printf("[FreeFire] Patched OFFSET_3 at 0x%lx\n", addr3);
+        }
+
+        // Hàm ghim tâm súng vào đầu địch
+        void aimlock_to_head(void) {
+            if (!aimlock_active || target_task == MACH_PORT_NULL || base_address == 0) {
+                return;
+            }
+
+            // Tìm bone_Head trong bộ nhớ
+            uintptr_t bone_head_ptr = find_bone_head_in_memory();
+            if (bone_head_ptr == 0) {
+                return;
+            }
+
+            // Đọc vị trí bone_Head (Vector3)
+            Vector3 head_pos;
+            if (!read_game_memory(bone_head_ptr - 0x20, &head_pos, sizeof(Vector3))) {
+                return;
+            }
+
+            // Tìm camera position trong bộ nhớ game
+            // Camera position thường nằm trong vùng nhớ của Unity
+            // Tìm pattern "Main Camera" hoặc sử dụng offset cố định
+            unsigned char cam_pattern[] = {0x4D, 0x61, 0x69, 0x6E, 0x20, 0x43, 0x61, 0x6D, 0x65, 0x72, 0x61};
+            uintptr_t cam_addr = find_pattern_in_memory(cam_pattern, sizeof(cam_pattern), base_address, base_address + 0x1000000);
+
+            if (cam_addr == 0) {
+                return;
+            }
+
+            // Đọc vị trí camera (thường cách pattern một khoảng)
+            Vector3 cam_pos;
+            if (!read_game_memory(cam_addr - 0x40, &cam_pos, sizeof(Vector3))) {
+                return;
+            }
+
+            // Tính toán hướng nhìn
+            Vector3 look_dir;
+            look_dir.x = head_pos.x - cam_pos.x;
+            look_dir.y = head_pos.y - cam_pos.y;
+            look_dir.z = head_pos.z - cam_pos.z;
+
+            // Chuẩn hóa vector
+            float len = sqrtf(look_dir.x * look_dir.x + look_dir.y * look_dir.y + look_dir.z * look_dir.z);
+            if (len > 0.001f) {
+                look_dir.x /= len;
+                look_dir.y /= len;
+                look_dir.z /= len;
+            } else {
+                return;
+            }
+
+            // Tìm và ghi rotation của camera trong bộ nhớ
+            // Camera rotation thường nằm gần camera position
+            // Ghi đè rotation để hướng về bone_Head
+            // Ở đây là giả lập, thực tế cần tìm đúng offset của camera rotation
+        }
+
+        // Thread aimlock
+        void* aimlock_thread_func(void* arg) {
             while (1) {
-                // Scan for bone_head pattern in memory
-                // Apply patches at offsets
-                // Actual implementation would scan game memory for enemy bone positions
-                usleep(10000);
+                if (aimlock_active) {
+                    aimlock_to_head();
+                }
+                usleep(5000); // 5ms
             }
             return NULL;
         }
 
-        // Constructor function
+        // Constructor function - tự động chạy khi dylib được load
         __attribute__((constructor))
-        void init() {
+        void init(void) {
             printf("[FreeFire] Aimlock dylib loaded\n");
 
-            // Apply anti-ban bypass patches
-            unsigned char patch_nop[] = {0x1F, 0x20, 0x03, 0xD5};
-            unsigned char patch_ret[] = {0xC0, 0x03, 0x5F, 0xD6};
+            // Tìm process FreeFire
+            if (!find_freefire_process()) {
+                printf("[FreeFire] Cannot find FreeFire process\n");
+                return;
+            }
+            printf("[FreeFire] Found FreeFire process\n");
 
-            // Patch offset 1: alcChatBubblePos() bone_Head
-            // Patch offset 2: adComponent no find bone_Head
-            // Patch offset 3: ull.boneWeightsbone_bone_Head
+            // Tìm base address
+            base_address = find_base_address();
+            if (base_address == 0) {
+                printf("[FreeFire] Cannot find base address\n");
+                return;
+            }
+            printf("[FreeFire] Base address: 0x%lx\n", base_address);
 
+            // Bypass antiban
+            bypass_antiban();
             printf("[FreeFire] Anti-ban bypass applied\n");
 
-            // Spawn aimlock thread
+            // Tạo thread aimlock
             pthread_t thread;
-            pthread_create(&thread, NULL, aimlock_thread, NULL);
-            pthread_detach(thread);
+            if (pthread_create(&thread, NULL, aimlock_thread_func, NULL) == 0) {
+                pthread_detach(thread);
+                printf("[FreeFire] Aimlock thread created\n");
+            } else {
+                printf("[FreeFire] Failed to create aimlock thread\n");
+            }
 
             printf("[FreeFire] Aimlock initialized\n");
         }
@@ -104,6 +311,7 @@ jobs:
         ls -la libaimlock.dylib
         file libaimlock.dylib
         otool -L libaimlock.dylib
+        nm -gU libaimlock.dylib | head -20 || true
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
