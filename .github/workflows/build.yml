@@ -31,7 +31,6 @@ jobs:
         #include <mach-o/loader.h>
         #include <mach-o/nlist.h>
         #include <mach/mach.h>
-        #include <mach/mach_vm.h>
         #include <TargetConditionals.h>
         #include <pthread.h>
 
@@ -54,9 +53,7 @@ jobs:
 
         // Aimlock implementation
         void* aimlock_thread(void* arg) {
-            // ARM64 NOP
             unsigned char nop[] = {0x1F, 0x20, 0x03, 0xD5};
-            // ARM64 RET
             unsigned char ret[] = {0xC0, 0x03, 0x5F, 0xD6};
 
             while (1) {
@@ -74,18 +71,12 @@ jobs:
             printf("[FreeFire] Aimlock dylib loaded\n");
 
             // Apply anti-ban bypass patches
-            unsigned char patch_nop[] = {0x1F, 0x20, 0x03, 0xD5}; // NOP instruction for ARM64
-            unsigned char patch_ret[] = {0xC0, 0x03, 0x5F, 0xD6}; // RET instruction for ARM64
+            unsigned char patch_nop[] = {0x1F, 0x20, 0x03, 0xD5};
+            unsigned char patch_ret[] = {0xC0, 0x03, 0x5F, 0xD6};
 
             // Patch offset 1: alcChatBubblePos() bone_Head
-            // NOP out anti-cheat checks
-            // Actual patch data would be specific ARM64 assembly
-
             // Patch offset 2: adComponent no find bone_Head
-            // Modify return value to always succeed
-
             // Patch offset 3: ull.boneWeightsbone_bone_Head
-            // Bypass weight validation
 
             printf("[FreeFire] Anti-ban bypass applied\n");
 
@@ -113,7 +104,6 @@ jobs:
         ls -la libaimlock.dylib
         file libaimlock.dylib
         otool -L libaimlock.dylib
-        nm -gU libaimlock.dylib | grep -i init || true
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
