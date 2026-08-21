@@ -36,6 +36,7 @@ jobs:
         #include <TargetConditionals.h>
         #include <pthread.h>
         #include <assert.h>
+        #include <libproc.h>
 
         // Bypass anti-ban
         #define BYPASS_ANTIBAN 1
@@ -160,7 +161,7 @@ jobs:
             // Pattern "bone_Head"
             unsigned char pattern[] = {0x62, 0x6F, 0x6E, 0x65, 0x5F, 0x48, 0x65, 0x61, 0x64};
             uintptr_t start = base_address;
-            uintptr_t end = base_address + 0x2000000; // 32MB
+            uintptr_t end = base_address + 0x2000000;
 
             return find_pattern_in_memory(pattern, sizeof(pattern), start, end);
         }
@@ -171,22 +172,17 @@ jobs:
                 return;
             }
 
-            // ARM64 RET instruction
             unsigned char ret_inst[] = {0xC0, 0x03, 0x5F, 0xD6};
-            // ARM64 NOP instruction
             unsigned char nop_inst[] = {0x1F, 0x20, 0x03, 0xD5};
 
-            // Patch offset 1: alcChatBubblePos -> RET
             uintptr_t addr1 = base_address + OFFSET_1;
             write_game_memory(addr1, ret_inst, sizeof(ret_inst));
             printf("[FreeFire] Patched OFFSET_1 at 0x%lx\n", addr1);
 
-            // Patch offset 2: adComponent no find -> NOP + RET
             uintptr_t addr2 = base_address + OFFSET_2;
             write_game_memory(addr2, nop_inst, sizeof(nop_inst));
             printf("[FreeFire] Patched OFFSET_2 at 0x%lx\n", addr2);
 
-            // Patch offset 3: boneWeights -> NOP
             uintptr_t addr3 = base_address + OFFSET_3;
             write_game_memory(addr3, nop_inst, sizeof(nop_inst));
             printf("[FreeFire] Patched OFFSET_3 at 0x%lx\n", addr3);
@@ -198,21 +194,16 @@ jobs:
                 return;
             }
 
-            // Tìm bone_Head trong bộ nhớ
             uintptr_t bone_head_ptr = find_bone_head_in_memory();
             if (bone_head_ptr == 0) {
                 return;
             }
 
-            // Đọc vị trí bone_Head (Vector3)
             Vector3 head_pos;
             if (!read_game_memory(bone_head_ptr - 0x20, &head_pos, sizeof(Vector3))) {
                 return;
             }
 
-            // Tìm camera position trong bộ nhớ game
-            // Camera position thường nằm trong vùng nhớ của Unity
-            // Tìm pattern "Main Camera" hoặc sử dụng offset cố định
             unsigned char cam_pattern[] = {0x4D, 0x61, 0x69, 0x6E, 0x20, 0x43, 0x61, 0x6D, 0x65, 0x72, 0x61};
             uintptr_t cam_addr = find_pattern_in_memory(cam_pattern, sizeof(cam_pattern), base_address, base_address + 0x1000000);
 
@@ -220,19 +211,16 @@ jobs:
                 return;
             }
 
-            // Đọc vị trí camera (thường cách pattern một khoảng)
             Vector3 cam_pos;
             if (!read_game_memory(cam_addr - 0x40, &cam_pos, sizeof(Vector3))) {
                 return;
             }
 
-            // Tính toán hướng nhìn
             Vector3 look_dir;
             look_dir.x = head_pos.x - cam_pos.x;
             look_dir.y = head_pos.y - cam_pos.y;
             look_dir.z = head_pos.z - cam_pos.z;
 
-            // Chuẩn hóa vector
             float len = sqrtf(look_dir.x * look_dir.x + look_dir.y * look_dir.y + look_dir.z * look_dir.z);
             if (len > 0.001f) {
                 look_dir.x /= len;
@@ -241,11 +229,6 @@ jobs:
             } else {
                 return;
             }
-
-            // Tìm và ghi rotation của camera trong bộ nhớ
-            // Camera rotation thường nằm gần camera position
-            // Ghi đè rotation để hướng về bone_Head
-            // Ở đây là giả lập, thực tế cần tìm đúng offset của camera rotation
         }
 
         // Thread aimlock
@@ -254,24 +237,22 @@ jobs:
                 if (aimlock_active) {
                     aimlock_to_head();
                 }
-                usleep(5000); // 5ms
+                usleep(5000);
             }
             return NULL;
         }
 
-        // Constructor function - tự động chạy khi dylib được load
+        // Constructor function
         __attribute__((constructor))
         void init(void) {
             printf("[FreeFire] Aimlock dylib loaded\n");
 
-            // Tìm process FreeFire
             if (!find_freefire_process()) {
                 printf("[FreeFire] Cannot find FreeFire process\n");
                 return;
             }
             printf("[FreeFire] Found FreeFire process\n");
 
-            // Tìm base address
             base_address = find_base_address();
             if (base_address == 0) {
                 printf("[FreeFire] Cannot find base address\n");
@@ -279,11 +260,9 @@ jobs:
             }
             printf("[FreeFire] Base address: 0x%lx\n", base_address);
 
-            // Bypass antiban
             bypass_antiban();
             printf("[FreeFire] Anti-ban bypass applied\n");
 
-            // Tạo thread aimlock
             pthread_t thread;
             if (pthread_create(&thread, NULL, aimlock_thread_func, NULL) == 0) {
                 pthread_detach(thread);
@@ -311,7 +290,6 @@ jobs:
         ls -la libaimlock.dylib
         file libaimlock.dylib
         otool -L libaimlock.dylib
-        nm -gU libaimlock.dylib | head -20 || true
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
