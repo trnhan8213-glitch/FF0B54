@@ -1,162 +1,154 @@
-name: Build FreeFire Aimlock Dylib
+name: Build Aimlock Dylib for FreeFire iOS
 
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Kiem tra code nguon
+        uses: actions/checkout@v4
 
-    - name: Create code.c
-      run: |
-        cat > code.c << 'EOF'
-        #include <stdio.h>
-        #include <string.h>
-        #include <stdlib.h>
-        #include <unistd.h>
-        #include <dlfcn.h>
-        #include <pthread.h>
-        #include <mach/mach.h>
-        #include <mach/task.h>
-        #include <libproc.h>
-        #include <TargetConditionals.h>
+      - name: Cai dat Xcode command line tools
+        run: |
+          xcode-select --install || true
+          sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer || true
 
-        #define OFFSET_1 0x00080BD5
-        #define OFFSET_2 0x000A8771
-        #define OFFSET_3 0x001D4B8C
+      - name: Cai dat build-essential (tuong duong tren macOS)
+        run: |
+          brew install gcc make cmake ninja
 
-        static mach_port_t task = MACH_PORT_NULL;
-        static uintptr_t base = 0;
+      - name: Tao thu muc chua ma nguon
+        run: |
+          mkdir -p src
+          cat > src/aimlock.c << 'EOF'
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <mach/mach.h>
+          #include <mach/mach_vm.h>
+          #include <pthread.h>
 
-        bool read_mem(uintptr_t addr, void* buf, size_t size) {
-            if (task == MACH_PORT_NULL) return false;
-            vm_size_t sz = 0;
-            kern_return_t kr = vm_read_overwrite(task, addr, size, (vm_address_t)buf, &sz);
-            return (kr == KERN_SUCCESS && sz == size);
-        }
+          // Offset tu data.txt
+          #define OFFSET_BONE_HEAD_1 0x00080BD5
+          #define OFFSET_BONE_HEAD_2 0x000A8771
+          #define OFFSET_BONE_HEAD_3 0x001D4B8C
 
-        bool write_mem(uintptr_t addr, void* buf, size_t size) {
-            if (task == MACH_PORT_NULL) return false;
-            kern_return_t kr = vm_write(task, addr, (vm_offset_t)buf, size);
-            return (kr == KERN_SUCCESS);
-        }
+          // Chuoi mau de tim kiem
+          const unsigned char bone_pattern[] = {
+            0x61, 0x6c, 0x63, 0x43, 0x68, 0x61, 0x74, 0x42,
+            0x75, 0x62, 0x62, 0x6c, 0x65, 0x50, 0x6f, 0x73,
+            0x28, 0x29, 0x3a, 0x20, 0x62, 0x6f, 0x6e, 0x65,
+            0x5f, 0x48, 0x65, 0x61, 0x64, 0x20
+          };
+          #define PATTERN_SIZE 30
 
-        int read_int(uintptr_t addr) {
-            int val = 0;
-            read_mem(addr, &val, sizeof(int));
-            return val;
-        }
+          // Ham doc bo nho
+          kern_return_t read_memory(task_t task, mach_vm_address_t address, void *buffer, mach_vm_size_t size) {
+            mach_vm_size_t out_size = 0;
+            return mach_vm_read_overwrite(task, address, size, (vm_address_t)buffer, &out_size);
+          }
 
-        float read_float(uintptr_t addr) {
-            float val = 0.0f;
-            read_mem(addr, &val, sizeof(float));
-            return val;
-        }
+          // Ham ghi bo nho
+          kern_return_t write_memory(task_t task, mach_vm_address_t address, const void *buffer, mach_vm_size_t size) {
+            return mach_vm_write(task, address, (vm_offset_t)buffer, size);
+          }
 
-        void find_game() {
-            pid_t pids[512];
-            int count = proc_listpids(PROC_ALL_PIDS, 0, pids, sizeof(pids)) / sizeof(pid_t);
-            for (int i = 0; i < count; i++) {
-                char path[PATH_MAX];
-                if (proc_pidpath(pids[i], path, sizeof(path)) > 0) {
-                    if (strstr(path, "FreeFire") || strstr(path, "com.dts.freefireth")) {
-                        task_for_pid(mach_task_self(), pids[i], &task);
-                        return;
-                    }
-                }
+          // Tim kiem pattern trong bo nho
+          mach_vm_address_t find_pattern(task_t task, mach_vm_address_t start, mach_vm_size_t size, const unsigned char *pattern, size_t pattern_len) {
+            unsigned char *buffer = malloc(size);
+            if (!buffer) return 0;
+
+            kern_return_t kr = read_memory(task, start, buffer, size);
+            if (kr != KERN_SUCCESS) {
+              free(buffer);
+              return 0;
             }
-        }
 
-        void get_base() {
-            struct task_dyld_info info;
-            mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
-            if (task_info(task, TASK_DYLD_INFO, (task_info_t)&info, &cnt) != KERN_SUCCESS) return;
-            
-            struct dyld_all_image_infos* infos = (struct dyld_all_image_infos*)info.all_image_info_addr;
-            if (!infos) return;
-            
-            for (uint32_t i = 0; i < infos->infoArrayCount; i++) {
-                const struct dyld_image_info* image = &infos->infoArray[i];
-                if (image->imageFilePath && 
-                    (strstr(image->imageFilePath, "FreeFire") || 
-                     strstr(image->imageFilePath, "com.dts.freefireth"))) {
-                    base = (uintptr_t)image->imageLoadAddress;
-                    return;
-                }
+            for (mach_vm_address_t i = 0; i <= size - pattern_len; i++) {
+              if (memcmp(buffer + i, pattern, pattern_len) == 0) {
+                mach_vm_address_t found = start + i;
+                free(buffer);
+                return found;
+              }
             }
-        }
 
-        void bypass() {
-            if (task == MACH_PORT_NULL || base == 0) return;
-            
-            unsigned char ret[] = {0xC0, 0x03, 0x5F, 0xD6};
-            unsigned char nop[] = {0x1F, 0x20, 0x03, 0xD5};
-            
-            write_mem(base + OFFSET_1, ret, 4);
-            write_mem(base + OFFSET_2, nop, 4);
-            write_mem(base + OFFSET_3, nop, 4);
-        }
-
-        uintptr_t find_bone_head() {
-            if (base == 0) return 0;
-            unsigned char pattern[] = {0x62, 0x6F, 0x6E, 0x65, 0x5F, 0x48, 0x65, 0x61, 0x64};
-            
-            for (uintptr_t addr = base; addr < base + 0x2000000; addr += 0x1000) {
-                unsigned char buf[4096];
-                if (!read_mem(addr, buf, sizeof(buf))) continue;
-                for (size_t i = 0; i < sizeof(buf) - sizeof(pattern); i++) {
-                    if (memcmp(buf + i, pattern, sizeof(pattern)) == 0) {
-                        return addr + i;
-                    }
-                }
-            }
+            free(buffer);
             return 0;
-        }
+          }
 
-        void* aimlock(void* arg) {
-            while (1) {
-                if (task != MACH_PORT_NULL && base != 0) {
-                    uintptr_t bone = find_bone_head();
-                    if (bone) {
-                        float x = read_float(bone - 0x20);
-                        float y = read_float(bone - 0x1C);
-                        float z = read_float(bone - 0x18);
-                    }
-                }
-                usleep(5000);
+          // Thread chinh cho aimlock
+          void *aimlock_thread(void *arg) {
+            task_t task = mach_task_self();
+            printf("Aimlock dylib da duoc nap, bat dau tim kiem offset...\n");
+
+            // Quet bo nho cua process hien tai (game)
+            mach_vm_address_t region_start = 0x100000000;
+            mach_vm_size_t region_size = 0x100000000;
+
+            mach_vm_address_t found_addr = find_pattern(task, region_start, region_size, bone_pattern, PATTERN_SIZE);
+            if (found_addr) {
+              printf("Tim thay pattern tai dia chi: 0x%llx\n", found_addr);
+
+              // Ghi du lieu thay doi de aimlock
+              // Thay doi gia tri bone_Head thanh gia tri aim
+              unsigned char aim_data[] = {0x61, 0x69, 0x6d, 0x5f, 0x68, 0x65, 0x61, 0x64};
+              kern_return_t kr = write_memory(task, found_addr + 0x10, aim_data, sizeof(aim_data));
+              if (kr == KERN_SUCCESS) {
+                printf("Da ghi aimlock tai offset: 0x%llx\n", found_addr + 0x10);
+              } else {
+                printf("Khong the ghi bo nho, error code: %d\n", kr);
+              }
+            } else {
+              printf("Khong tim thay pattern bone_Head trong bo nho\n");
             }
+
             return NULL;
-        }
+          }
 
-        __attribute__((constructor))
-        void init() {
-            find_game();
-            if (task == MACH_PORT_NULL) return;
-            get_base();
-            if (!base) return;
-            bypass();
-            
-            pthread_t t;
-            pthread_create(&t, NULL, aimlock, NULL);
-            pthread_detach(t);
-        }
-        EOF
+          // Ham duoc goi khi dylib duoc nap
+          __attribute__((constructor)) void init() {
+            pthread_t thread;
+            pthread_create(&thread, NULL, aimlock_thread, NULL);
+            pthread_detach(thread);
+          }
 
-    - name: Compile to iOS dylib
-      run: |
-        SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-        clang -arch arm64 -isysroot $SDK_PATH \
-          -dynamiclib -compatibility_version 1.0 -current_version 1.0 \
-          -o libaimlock.dylib code.c \
-          -framework Foundation -framework UIKit \
-          -mios-version-min=13.0 -O2 \
-          -undefined dynamic_lookup
+          // Ham de tranh canh bao
+          void dummy_function() {}
+          EOF
 
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: libaimlock.dylib
-        path: libaimlock.dylib
+      - name: Bien dich ra dylib
+        run: |
+          gcc -Wall -Wextra -O2 -dynamiclib -install_name @rpath/libaimlock.dylib \
+            -framework CoreFoundation -framework IOKit \
+            -o libaimlock.dylib src/aimlock.c
+
+      - name: Kiem tra file dylib ton tai
+        run: |
+          if [ -f "libaimlock.dylib" ]; then
+            echo "File libaimlock.dylib duoc tao thanh cong"
+            file libaimlock.dylib
+            otool -L libaimlock.dylib
+            ls -la libaimlock.dylib
+          else
+            echo "LOI: Khong tim thay libaimlock.dylib"
+            exit 1
+          fi
+
+      - name: Tinh checksum cho dylib
+        run: |
+          shasum -a 256 libaimlock.dylib > libaimlock.dylib.sha256
+          cat libaimlock.dylib.sha256
+
+      - name: Upload artifact dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: libaimlock
+          path: |
+            libaimlock.dylib
+            libaimlock.dylib.sha256
+          retention-days: 7
