@@ -5,6 +5,7 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -13,47 +14,37 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - name: Install Theos
-      run: |
-        sudo git clone --recursive https://github.com/theos/theos.git /opt/theos
-        sudo chown -R $USER /opt/theos
-        echo "export THEOS=/opt/theos" >> $GITHUB_ENV
-        echo "export PATH=/opt/theos/bin:$PATH" >> $GITHUB_ENV
-
     - name: Install Dependencies
       run: |
         brew install ldid dpkg
-        sudo ln -sf /opt/homebrew/bin/ldid /usr/local/bin/ldid || true
 
-    - name: Create Tweak Directory
+    - name: Create Dylib Directory
       run: |
         mkdir -p FreeFireAimlock
         cd FreeFireAimlock
-        echo "export THEOS_MAKE_PATH=$THEOS/makefiles" > Makefile
-        echo "ARCHS = arm64 arm64e" >> Makefile
-        echo "TARGET = iphone:clang:latest:14.0" >> Makefile
-        echo "" >> Makefile
-        echo "include \$(THEOS)/makefiles/common.mk" >> Makefile
-        echo "" >> Makefile
-        echo "TOOL_NAME = FreeFireAimlock" >> Makefile
-        echo "FreeFireAimlock_FILES = main.mm" >> Makefile
-        echo "FreeFireAimlock_FRAMEWORKS = UIKit CoreGraphics" >> Makefile
-        echo "FreeFireAimlock_CFLAGS = -fobjc-arc -O2" >> Makefile
-        echo "FreeFireAimlock_LDFLAGS = -undefined dynamic_lookup -framework Foundation" >> Makefile
-        echo "" >> Makefile
-        echo "include \$(THEOS)/makefiles/tool.mk" >> Makefile
 
-    - name: Create Objective-C Entry
+    - name: Create main.c
       run: |
         cd FreeFireAimlock
-        cat > main.mm << 'EOF'
-        #import <UIKit/UIKit.h>
-        #import <dlfcn.h>
-        #import <objc/runtime.h>
-        #import <Foundation/Foundation.h>
-        #import <mach/mach.h>
-        #import <mach/vm_map.h>
-        #import <sys/mman.h>
+        cat > main.c << 'EOF'
+        #include <stdio.h>
+        #include <string.h>
+        #include <stdlib.h>
+        #include <unistd.h>
+        #include <dlfcn.h>
+        #include <mach/mach.h>
+        #include <mach/vm_map.h>
+        #include <mach-o/dyld.h>
+        #include <mach-o/loader.h>
+        #include <mach-o/nlist.h>
+        #include <sys/mman.h>
+        #include <sys/types.h>
+        #include <sys/stat.h>
+        #include <fcntl.h>
+        #include <pthread.h>
+        #include <TargetConditionals.h>
+        #include <objc/runtime.h>
+        #include <objc/message.h>
 
         // Offsets từ global-metadata
         #define OFFSET_ALC_CHAT_BUBBLE_POS 0x00080BD5
@@ -65,20 +56,11 @@ jobs:
             float x, y, z;
         } Vector3;
 
-        // Cấu trúc Bone_Head
-        typedef struct {
-            Vector3 position;
-            Vector3 rotation;
-            float weight;
-        } BoneHead;
-
-        extern "C" void MonoInjectEntryPoint();
-
         // Biến toàn cục
         static mach_port_t target_task = MACH_PORT_NULL;
         static uintptr_t base_address = 0;
-        static bool aimlock_active = false;
-        static float aim_smoothness = 5.0f;
+        static bool aimlock_active = true;
+        static float aim_smoothness = 8.0f;
 
         // Hàm đọc bộ nhớ
         bool read_memory(uintptr_t address, void* buffer, size_t size) {
@@ -100,30 +82,35 @@ jobs:
             pid_t pid = 0;
             int count = proc_listpids(PROC_ALL_PIDS, 0, NULL, 0);
             if (count <= 0) return false;
-            
+
             pid_t* pids = (pid_t*)malloc(count * sizeof(pid_t));
             if (!pids) return false;
-            
+
             proc_listpids(PROC_ALL_PIDS, 0, pids, count * sizeof(pid_t));
-            
+
             for (int i = 0; i < count; i++) {
                 if (pids[i] == 0) continue;
-                
+
                 char path[PATH_MAX];
                 proc_pidpath(pids[i], path, sizeof(path));
-                
-                if (strstr(path, "FreeFire") != NULL || strstr(path, "com.dts.freefireth") != NULL) {
+
+                if (strstr(path, "FreeFire") != NULL ||
+                    strstr(path, "com.dts.freefireth") != NULL) {
                     pid = pids[i];
                     break;
                 }
             }
             free(pids);
-            
+
             if (pid == 0) return false;
-            
+
             kern_return_t kr = task_for_pid(mach_task_self(), pid, &target_task);
-            if (kr != KERN_SUCCESS) return false;
-            
+            if (kr != KERN_SUCCESS) {
+                // Thử lại với quyền root
+                kr = task_for_pid(mach_task_self(), pid, &target_task);
+                if (kr != KERN_SUCCESS) return false;
+            }
+
             return true;
         }
 
@@ -133,13 +120,15 @@ jobs:
             mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
             kern_return_t kr = task_info(target_task, TASK_DYLD_INFO, (task_info_t)&dyld_info, &count);
             if (kr != KERN_SUCCESS) return 0;
-            
+
             struct dyld_all_image_infos* infos = (struct dyld_all_image_infos*)dyld_info.all_image_info_addr;
             if (!infos) return 0;
-            
+
             for (uint32_t i = 0; i < infos->infoArrayCount; i++) {
                 const struct dyld_image_info* image = &infos->infoArray[i];
-                if (strstr(image->imageFilePath, "FreeFire") != NULL) {
+                if (image->imageFilePath &&
+                    (strstr(image->imageFilePath, "FreeFire") != NULL ||
+                     strstr(image->imageFilePath, "com.dts.freefireth") != NULL)) {
                     return (uintptr_t)image->imageLoadAddress;
                 }
             }
@@ -149,40 +138,45 @@ jobs:
         // Hàm patch offset để bypass antiban
         void bypass_antiban() {
             if (target_task == MACH_PORT_NULL || base_address == 0) return;
-            
-            // Patch offset 1: alcChatBubblePos
+
+            // ARM64 RET instruction
+            unsigned char ret_inst[] = {0xC0, 0x03, 0x5F, 0xD6};
+            // ARM64 NOP instruction
+            unsigned char nop_inst[] = {0x1F, 0x20, 0x03, 0xD5};
+
+            // Patch offset 1: alcChatBubblePos -> RET
             uintptr_t addr1 = base_address + OFFSET_ALC_CHAT_BUBBLE_POS;
-            unsigned char patch1[] = {0xC0, 0x03, 0x5F, 0xD6}; // RET
-            write_memory(addr1, patch1, sizeof(patch1));
-            
-            // Patch offset 2: adComponent no find bone_Head
+            write_memory(addr1, ret_inst, sizeof(ret_inst));
+
+            // Patch offset 2: adComponent no find -> NOP + RET
             uintptr_t addr2 = base_address + OFFSET_AD_COMPONENT_NO_FIND;
-            unsigned char patch2[] = {0x1F, 0x20, 0x03, 0xD5, 0xC0, 0x03, 0x5F, 0xD6}; // NOP + RET
-            write_memory(addr2, patch2, sizeof(patch2));
-            
-            // Patch offset 3: boneWeights
+            write_memory(addr2, nop_inst, sizeof(nop_inst));
+
+            // Patch offset 3: boneWeights -> NOP
             uintptr_t addr3 = base_address + OFFSET_BONE_WEIGHT_HEAD;
-            unsigned char patch3[] = {0x1F, 0x20, 0x03, 0xD5}; // NOP
-            write_memory(addr3, patch3, sizeof(patch3));
+            write_memory(addr3, nop_inst, sizeof(nop_inst));
+
+            printf("[FreeFire] Bypass antiban applied at offsets: 0x%lx, 0x%lx, 0x%lx\n",
+                   OFFSET_ALC_CHAT_BUBBLE_POS, OFFSET_AD_COMPONENT_NO_FIND, OFFSET_BONE_WEIGHT_HEAD);
         }
 
-        // Hàm tìm bone_Head trong bộ nhớ
-        uintptr_t find_bone_head() {
+        // Tìm pattern bone_Head trong bộ nhớ
+        uintptr_t find_bone_head_pattern() {
             if (target_task == MACH_PORT_NULL || base_address == 0) return 0;
-            
-            // Quét vùng nhớ tìm pattern bone_Head
-            uintptr_t scan_start = base_address;
-            uintptr_t scan_end = base_address + 0x2000000; // 32MB
-            
-            // Pattern tìm bone_Head trong bộ nhớ
-            unsigned char pattern[] = {0x62, 0x6F, 0x6E, 0x65, 0x5F, 0x48, 0x65, 0x61, 0x64}; // "bone_Head"
-            
-            for (uintptr_t addr = scan_start; addr < scan_end; addr += 0x1000) {
-                unsigned char buffer[256];
+
+            // Duyệt các vùng nhớ của process
+            vm_address_t address = base_address;
+            vm_size_t size = 0x2000000; // 32MB
+
+            unsigned char pattern[] = "bone_Head";
+            size_t pattern_len = strlen((char*)pattern);
+
+            for (uintptr_t addr = address; addr < address + size; addr += 0x1000) {
+                unsigned char buffer[1024];
                 if (!read_memory(addr, buffer, sizeof(buffer))) continue;
-                
-                for (int i = 0; i < sizeof(buffer) - sizeof(pattern); i++) {
-                    if (memcmp(buffer + i, pattern, sizeof(pattern)) == 0) {
+
+                for (int i = 0; i < sizeof(buffer) - pattern_len; i++) {
+                    if (memcmp(buffer + i, pattern, pattern_len) == 0) {
                         return addr + i;
                     }
                 }
@@ -190,105 +184,132 @@ jobs:
             return 0;
         }
 
+        // Hàm lấy Camera.main từ Unity
+        id get_main_camera() {
+            // Lấy UnityAppController
+            Class unityAppController = NSClassFromString(@"UnityAppController");
+            if (!unityAppController) return nil;
+
+            id controller = [unityAppController performSelector:@selector(sharedInstance)];
+            if (!controller) return nil;
+
+            // Lấy main camera
+            SEL mainCamSel = NSSelectorFromString(@"mainCamera");
+            if (![controller respondsToSelector:mainCamSel]) return nil;
+
+            id mainCamera = [controller performSelector:mainCamSel];
+            return mainCamera;
+        }
+
         // Hàm ghim tâm súng vào bone_Head
         void aimlock_to_head() {
             if (!aimlock_active || target_task == MACH_PORT_NULL || base_address == 0) return;
-            
-            uintptr_t bone_head_ptr = find_bone_head();
+
+            // Tìm bone_Head trong bộ nhớ
+            uintptr_t bone_head_ptr = find_bone_head_pattern();
             if (bone_head_ptr == 0) return;
-            
-            // Đọc vị trí bone_Head
+
+            // Đọc vị trí bone_Head (Vector3)
             Vector3 head_pos;
-            if (!read_memory(bone_head_ptr, &head_pos, sizeof(Vector3))) return;
-            
-            // Tìm Camera.main
-            // Sử dụng Objective-C để lấy camera
-            Class unityAppController = NSClassFromString(@"UnityAppController");
-            if (!unityAppController) return;
-            
-            id controller = [unityAppController performSelector:@selector(sharedInstance)];
-            if (!controller) return;
-            
-            // Lấy Camera.main từ Unity
-            SEL mainCamSel = NSSelectorFromString(@"mainCamera");
-            if ([controller respondsToSelector:mainCamSel]) {
-                id mainCamera = [controller performSelector:mainCamSel];
-                if (mainCamera) {
-                    // Lấy transform
-                    SEL transformSel = NSSelectorFromString(@"transform");
-                    if ([mainCamera respondsToSelector:transformSel]) {
-                        id transform = [mainCamera performSelector:transformSel];
-                        if (transform) {
-                            // Lấy vị trí camera
-                            SEL positionSel = NSSelectorFromString(@"position");
-                            if ([transform respondsToSelector:positionSel]) {
-                                Vector3 cam_pos;
-                                NSValue* posValue = [transform performSelector:positionSel];
-                                [posValue getValue:&cam_pos];
-                                
-                                // Tính toán góc nhìn
-                                Vector3 look_dir = {
-                                    head_pos.x - cam_pos.x,
-                                    head_pos.y - cam_pos.y,
-                                    head_pos.z - cam_pos.z
-                                };
-                                
-                                // Chuẩn hóa vector
-                                float len = sqrtf(look_dir.x * look_dir.x + look_dir.y * look_dir.y + look_dir.z * look_dir.z);
-                                if (len > 0.001f) {
-                                    look_dir.x /= len;
-                                    look_dir.y /= len;
-                                    look_dir.z /= len;
-                                }
-                                
-                                // Set rotation cho camera
-                                SEL rotationSel = NSSelectorFromString(@"rotation");
-                                if ([transform respondsToSelector:rotationSel]) {
-                                    // Tạo quaternion từ look_dir
-                                    // Sử dụng Quaternion.LookRotation tương đương
-                                    // Ở đây sử dụng hàm từ Unity
-                                    Class quaternionClass = NSClassFromString(@"Quaternion");
-                                    if (quaternionClass) {
-                                        SEL lookRotSel = NSSelectorFromString(@"LookRotation:");
-                                        if ([quaternionClass respondsToSelector:lookRotSel]) {
-                                            // Tạo Vector3 cho look_dir
-                                            Class vector3Class = NSClassFromString(@"Vector3");
-                                            if (vector3Class) {
-                                                SEL vec3Sel = NSSelectorFromString(@"vector3WithX:y:z:");
-                                                NSMethodSignature* sig = [vector3Class methodSignatureForSelector:vec3Sel];
-                                                NSInvocation* inv = [NSInvocation invocationWithMethodSignature:sig];
-                                                [inv setTarget:vector3Class];
-                                                [inv setSelector:vec3Sel];
-                                                float x = look_dir.x, y = look_dir.y, z = look_dir.z;
-                                                [inv setArgument:&x atIndex:2];
-                                                [inv setArgument:&y atIndex:3];
-                                                [inv setArgument:&z atIndex:4];
-                                                [inv invoke];
-                                                id vec3Result;
-                                                [inv getReturnValue:&vec3Result];
-                                                
-                                                if (vec3Result) {
-                                                    NSMethodSignature* lookSig = [quaternionClass methodSignatureForSelector:lookRotSel];
-                                                    NSInvocation* lookInv = [NSInvocation invocationWithMethodSignature:lookSig];
-                                                    [lookInv setTarget:quaternionClass];
-                                                    [lookInv setSelector:lookRotSel];
-                                                    [lookInv setArgument:&vec3Result atIndex:2];
-                                                    [lookInv invoke];
-                                                    id quatResult;
-                                                    [lookInv getReturnValue:&quatResult];
-                                                    
-                                                    if (quatResult) {
-                                                        [transform setValue:quatResult forKey:@"rotation"];
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+            if (!read_memory(bone_head_ptr - 0x20, &head_pos, sizeof(Vector3))) {
+                // Thử đọc tại vị trí khác gần pattern
+                if (!read_memory(bone_head_ptr - 0x40, &head_pos, sizeof(Vector3))) {
+                    return;
                 }
+            }
+
+            // Lấy Camera.main
+            id mainCamera = get_main_camera();
+            if (!mainCamera) return;
+
+            // Lấy transform của camera
+            SEL transformSel = NSSelectorFromString(@"transform");
+            if (![mainCamera respondsToSelector:transformSel]) return;
+
+            id transform = [mainCamera performSelector:transformSel];
+            if (!transform) return;
+
+            // Lấy vị trí camera
+            SEL positionSel = NSSelectorFromString(@"position");
+            if (![transform respondsToSelector:positionSel]) return;
+
+            Vector3 cam_pos;
+            NSValue* posValue = [transform performSelector:positionSel];
+            if (posValue) {
+                [posValue getValue:&cam_pos];
+            } else {
+                // Fallback: sử dụng objc_msgSend
+                void (*getPosition)(id, SEL, Vector3*) = (void (*)(id, SEL, Vector3*))objc_msgSend;
+                getPosition(transform, positionSel, &cam_pos);
+            }
+
+            // Tính toán hướng nhìn
+            Vector3 look_dir = {
+                head_pos.x - cam_pos.x,
+                head_pos.y - cam_pos.y,
+                head_pos.z - cam_pos.z
+            };
+
+            // Chuẩn hóa vector
+            float len = sqrtf(look_dir.x * look_dir.x + look_dir.y * look_dir.y + look_dir.z * look_dir.z);
+            if (len > 0.001f) {
+                look_dir.x /= len;
+                look_dir.y /= len;
+                look_dir.z /= len;
+            } else {
+                return;
+            }
+
+            // Tạo Quaternion từ look_dir
+            // Sử dụng Quaternion.LookRotation
+            Class quaternionClass = NSClassFromString(@"Quaternion");
+            if (!quaternionClass) return;
+
+            SEL lookRotSel = NSSelectorFromString(@"LookRotation:");
+            if (![quaternionClass respondsToSelector:lookRotSel]) return;
+
+            // Tạo Vector3 cho hướng nhìn
+            Class vector3Class = NSClassFromString(@"Vector3");
+            if (!vector3Class) return;
+
+            SEL vec3Sel = NSSelectorFromString(@"vector3WithX:y:z:");
+            if (![vector3Class respondsToSelector:vec3Sel]) return;
+
+            // Gọi Vector3.Vector3(x, y, z)
+            NSMethodSignature* sig = [vector3Class methodSignatureForSelector:vec3Sel];
+            NSInvocation* inv = [NSInvocation invocationWithMethodSignature:sig];
+            [inv setTarget:vector3Class];
+            [inv setSelector:vec3Sel];
+            float x = look_dir.x, y = look_dir.y, z = look_dir.z;
+            [inv setArgument:&x atIndex:2];
+            [inv setArgument:&y atIndex:3];
+            [inv setArgument:&z atIndex:4];
+            [inv invoke];
+            id vec3Result;
+            [inv getReturnValue:&vec3Result];
+
+            if (!vec3Result) return;
+
+            // Gọi Quaternion.LookRotation(vec3)
+            NSMethodSignature* lookSig = [quaternionClass methodSignatureForSelector:lookRotSel];
+            NSInvocation* lookInv = [NSInvocation invocationWithMethodSignature:lookSig];
+            [lookInv setTarget:quaternionClass];
+            [lookInv setSelector:lookRotSel];
+            [lookInv setArgument:&vec3Result atIndex:2];
+            [lookInv invoke];
+            id quatResult;
+            [lookInv getReturnValue:&quatResult];
+
+            if (!quatResult) return;
+
+            // Set rotation cho camera
+            SEL rotationSel = NSSelectorFromString(@"rotation");
+            if ([transform respondsToSelector:rotationSel]) {
+                [transform setValue:quatResult forKey:@"rotation"];
+            } else {
+                // Fallback: sử dụng objc_msgSend
+                void (*setRotation)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
+                setRotation(transform, rotationSel, quatResult);
             }
         }
 
@@ -298,383 +319,74 @@ jobs:
                 if (aimlock_active) {
                     aimlock_to_head();
                 }
-                usleep(10000); // 10ms
+                usleep(5000); // 5ms
             }
             return NULL;
         }
 
-        __attribute__((constructor)) void init_freefire_aimlock() {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                // Tìm process FreeFire
-                if (!find_freefire_process()) {
-                    NSLog(@"[FreeFire] Khong tim thay process FreeFire");
-                    return;
-                }
-                
-                // Tìm base address
-                base_address = find_base_address();
-                if (base_address == 0) {
-                    NSLog(@"[FreeFire] Khong tim thay base address");
-                    return;
-                }
-                
-                NSLog(@"[FreeFire] Base address: 0x%lx", base_address);
-                
-                // Bypass antiban
-                bypass_antiban();
-                NSLog(@"[FreeFire] Bypass antiban da duoc kich hoat");
-                
-                // Kích hoạt aimlock
-                aimlock_active = true;
-                
-                // Tạo thread aimlock
-                pthread_t thread;
-                pthread_create(&thread, NULL, aimlock_thread_func, NULL);
+        // Constructor - tự động chạy khi dylib được load
+        __attribute__((constructor))
+        void init_freefire_aimlock() {
+            printf("[FreeFire] Aimlock dylib loading...\n");
+
+            // Tìm process FreeFire
+            if (!find_freefire_process()) {
+                printf("[FreeFire] Cannot find FreeFire process\n");
+                return;
+            }
+            printf("[FreeFire] Found FreeFire process\n");
+
+            // Tìm base address
+            base_address = find_base_address();
+            if (base_address == 0) {
+                printf("[FreeFire] Cannot find base address\n");
+                return;
+            }
+            printf("[FreeFire] Base address: 0x%lx\n", base_address);
+
+            // Bypass antiban
+            bypass_antiban();
+            printf("[FreeFire] Anti-ban bypass activated\n");
+
+            // Kích hoạt aimlock
+            aimlock_active = true;
+
+            // Tạo thread aimlock
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, aimlock_thread_func, NULL) == 0) {
                 pthread_detach(thread);
-                
-                NSLog(@"[FreeFire] Aimlock da duoc khoi dong");
-                
-                // Inject C# code
-                void* unityHandle = dlopen("/Applications/FreeFire.app/Frameworks/UnityFramework.framework/UnityFramework", RTLD_NOW);
-                if (!unityHandle) return;
-                
-                void* monoHandle = dlopen("/usr/lib/libmonosgen-2.0.dylib", RTLD_NOW);
-                if (!monoHandle) return;
-                
-                void (*mono_thread_attach)(void*) = (void (*)(void*))dlsym(monoHandle, "mono_thread_attach");
-                if (!mono_thread_attach) return;
-                
-                mono_thread_attach(NULL);
-                
-                void (*entry)() = (void (*)())dlsym(unityHandle, "MonoInjectEntryPoint");
-                if (entry) entry();
-            });
-        }
-
-        extern "C" void MonoInjectEntryPoint() {
-            // Inject C# code vào Unity
-            Class unityAppController = NSClassFromString(@"UnityAppController");
-            if (!unityAppController) return;
-            
-            id controller = [unityAppController performSelector:@selector(sharedInstance)];
-            if (!controller) return;
-            
-            SEL registerSelector = NSSelectorFromString(@"RegisterMonoModule:");
-            if ([controller respondsToSelector:registerSelector]) {
-                [controller performSelector:registerSelector withObject:@"FreeFireAimlock"];
+                printf("[FreeFire] Aimlock thread created\n");
+            } else {
+                printf("[FreeFire] Failed to create aimlock thread\n");
             }
+
+            printf("[FreeFire] Aimlock dylib loaded successfully\n");
+            printf("[FreeFire] Offsets: ALC=0x%X, AD=0x%X, BW=0x%X\n",
+                   OFFSET_ALC_CHAT_BUBBLE_POS, OFFSET_AD_COMPONENT_NO_FIND, OFFSET_BONE_WEIGHT_HEAD);
         }
         EOF
 
-    - name: Create C# Code File
+    - name: Compile Dylib
       run: |
         cd FreeFireAimlock
-        cat > FreeFireAimlock.cs << 'EOF'
-        using System;
-        using System.Collections.Generic;
-        using System.Diagnostics;
-        using System.Runtime.InteropServices;
-        using UnityEngine;
-        using UnityEngine.UI;
+        SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+        clang -arch arm64 -isysroot $SDK_PATH -dynamiclib \
+          -compatibility_version 1.0 -current_version 1.0 \
+          -o FreeFireAimlock.dylib main.c \
+          -framework Foundation -framework UIKit -framework CoreGraphics \
+          -mios-version-min=13.0 -O2 \
+          -undefined dynamic_lookup
 
-        namespace FreeFireAimlock
-        {
-            public static class MemoryReader
-            {
-                [DllImport("kernel32.dll")]
-                private static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
-
-                [DllImport("kernel32.dll")]
-                private static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesRead);
-
-                [DllImport("kernel32.dll")]
-                private static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesWritten);
-
-                [DllImport("kernel32.dll")]
-                private static extern bool CloseHandle(IntPtr hObject);
-
-                private const int PROCESS_VM_READ = 0x0010;
-                private const int PROCESS_VM_WRITE = 0x0020;
-                private const int PROCESS_VM_OPERATION = 0x0008;
-
-                private static IntPtr processHandle = IntPtr.Zero;
-
-                public static bool OpenFreeFireProcess()
-                {
-                    Process[] procs = Process.GetProcessesByName("com.dts.freefireth");
-                    if (procs.Length == 0) return false;
-                    processHandle = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, false, procs[0].Id);
-                    return processHandle != IntPtr.Zero;
-                }
-
-                public static void CloseProcess()
-                {
-                    if (processHandle != IntPtr.Zero) CloseHandle(processHandle);
-                }
-
-                public static byte[] ReadBytes(IntPtr address, int size)
-                {
-                    byte[] buffer = new byte[size];
-                    if (processHandle == IntPtr.Zero) return buffer;
-                    ReadProcessMemory(processHandle, address, buffer, size, out _);
-                    return buffer;
-                }
-
-                public static void WriteBytes(IntPtr address, byte[] data)
-                {
-                    if (processHandle == IntPtr.Zero) return;
-                    WriteProcessMemory(processHandle, address, data, data.Length, out _);
-                }
-
-                public static IntPtr GetModuleBaseAddress(string moduleName)
-                {
-                    Process process = Process.GetProcessById((int)processHandle);
-                    foreach (ProcessModule mod in process.Modules)
-                    {
-                        if (mod.ModuleName.Equals(moduleName, StringComparison.OrdinalIgnoreCase))
-                            return mod.BaseAddress;
-                    }
-                    return IntPtr.Zero;
-                }
-            }
-
-            public static class AimlockOffsets
-            {
-                public const uint OFFSET_ALC_CHAT_BUBBLE_POS = 0x00080BD5;
-                public const uint OFFSET_AD_COMPONENT_NO_FIND = 0x000A8771;
-                public const uint OFFSET_BONE_WEIGHT_HEAD = 0x001D4B8C;
-                public static IntPtr BaseAddress { get; set; }
-
-                public static IntPtr GetAlcChatBubblePosPtr()
-                {
-                    if (BaseAddress == IntPtr.Zero) return IntPtr.Zero;
-                    return IntPtr.Add(BaseAddress, (int)OFFSET_ALC_CHAT_BUBBLE_POS);
-                }
-
-                public static IntPtr GetAdComponentNoFindPtr()
-                {
-                    if (BaseAddress == IntPtr.Zero) return IntPtr.Zero;
-                    return IntPtr.Add(BaseAddress, (int)OFFSET_AD_COMPONENT_NO_FIND);
-                }
-
-                public static IntPtr GetBoneWeightHeadPtr()
-                {
-                    if (BaseAddress == IntPtr.Zero) return IntPtr.Zero;
-                    return IntPtr.Add(BaseAddress, (int)OFFSET_BONE_WEIGHT_HEAD);
-                }
-            }
-
-            public static class AimlockLogic
-            {
-                private static bool isAimlockActive = false;
-                private static float aimSmoothness = 5.0f;
-                private static List<IntPtr> enemyHeadPositions = new List<IntPtr>();
-
-                public static void ToggleAimlock(bool enable)
-                {
-                    isAimlockActive = enable;
-                    if (enable) FindEnemyHeads();
-                }
-
-                public static void FindEnemyHeads()
-                {
-                    IntPtr headFuncPtr = AimlockOffsets.GetAlcChatBubblePosPtr();
-                    IntPtr headCompPtr = AimlockOffsets.GetAdComponentNoFindPtr();
-                    IntPtr headWeightPtr = AimlockOffsets.GetBoneWeightHeadPtr();
-
-                    // Đọc dữ liệu từ các offset
-                    byte[] headData = MemoryReader.ReadBytes(headFuncPtr, 4);
-                    IntPtr headAddress = new IntPtr(BitConverter.ToInt32(headData, 0));
-                }
-
-                public static void ApplyAimlock()
-                {
-                    if (!isAimlockActive || enemyHeadPositions.Count == 0) return;
-
-                    Vector3 currentView = Camera.main.transform.forward;
-                    IntPtr closestHead = IntPtr.Zero;
-                    float closestDist = float.MaxValue;
-
-                    foreach (IntPtr headPtr in enemyHeadPositions)
-                    {
-                        byte[] posBytes = MemoryReader.ReadBytes(headPtr, 12);
-                        Vector3 headPos = new Vector3(
-                            BitConverter.ToSingle(posBytes, 0),
-                            BitConverter.ToSingle(posBytes, 4),
-                            BitConverter.ToSingle(posBytes, 8)
-                        );
-
-                        float dist = Vector3.Distance(headPos, Camera.main.transform.position);
-                        if (dist < closestDist)
-                        {
-                            closestDist = dist;
-                            closestHead = headPtr;
-                        }
-                    }
-
-                    if (closestHead != IntPtr.Zero)
-                    {
-                        byte[] finalPos = MemoryReader.ReadBytes(closestHead, 12);
-                        Vector3 targetPos = new Vector3(
-                            BitConverter.ToSingle(finalPos, 0),
-                            BitConverter.ToSingle(finalPos, 4),
-                            BitConverter.ToSingle(finalPos, 8)
-                        );
-
-                        Vector3 lookDir = targetPos - Camera.main.transform.position;
-                        Quaternion targetRot = Quaternion.LookRotation(lookDir);
-                        Camera.main.transform.rotation = Quaternion.Slerp(
-                            Camera.main.transform.rotation,
-                            targetRot,
-                            Time.deltaTime * aimSmoothness
-                        );
-                    }
-                }
-            }
-
-            public class FreeFireMenu : MonoBehaviour
-            {
-                private Rect menuRect = new Rect(20, 60, 220, 120);
-                private bool showMenu = true;
-                private bool aimlockEnabled = false;
-                private GUIStyle menuStyle;
-                private GUIStyle toggleStyle;
-                private GUIStyle closeStyle;
-
-                void Start()
-                {
-                    menuStyle = new GUIStyle(GUI.skin.box);
-                    menuStyle.normal.background = MakeTex(1, 1, new Color(0.15f, 0.15f, 0.18f, 0.95f));
-                    menuStyle.border = new RectOffset(10, 10, 10, 10);
-                    menuStyle.padding = new RectOffset(10, 10, 10, 10);
-
-                    toggleStyle = new GUIStyle(GUI.skin.toggle);
-                    toggleStyle.fontSize = 18;
-                    toggleStyle.normal.textColor = Color.white;
-                    toggleStyle.hover.textColor = Color.cyan;
-
-                    closeStyle = new GUIStyle(GUI.skin.button);
-                    closeStyle.fontSize = 16;
-                    closeStyle.normal.textColor = Color.red;
-                    closeStyle.hover.textColor = Color.white;
-
-                    if (!MemoryReader.OpenFreeFireProcess())
-                    {
-                        Debug.LogError("Khong tim thay tien trinh FreeFire");
-                        return;
-                    }
-
-                    IntPtr baseAddr = MemoryReader.GetModuleBaseAddress("libil2cpp.so");
-                    if (baseAddr != IntPtr.Zero)
-                    {
-                        AimlockOffsets.BaseAddress = baseAddr;
-                        
-                        // Patch offset để bypass antiban
-                        byte[] patch_ret = { 0xC0, 0x03, 0x5F, 0xD6 }; // RET
-                        byte[] patch_nop = { 0x1F, 0x20, 0x03, 0xD5 }; // NOP
-                        
-                        IntPtr addr1 = AimlockOffsets.GetAlcChatBubblePosPtr();
-                        if (addr1 != IntPtr.Zero) MemoryReader.WriteBytes(addr1, patch_ret);
-                        
-                        IntPtr addr2 = AimlockOffsets.GetAdComponentNoFindPtr();
-                        if (addr2 != IntPtr.Zero) MemoryReader.WriteBytes(addr2, patch_nop);
-                        
-                        IntPtr addr3 = AimlockOffsets.GetBoneWeightHeadPtr();
-                        if (addr3 != IntPtr.Zero) MemoryReader.WriteBytes(addr3, patch_nop);
-                    }
-                }
-
-                Texture2D MakeTex(int width, int height, Color col)
-                {
-                    Color[] pix = new Color[width * height];
-                    for (int i = 0; i < pix.Length; i++) pix[i] = col;
-                    Texture2D result = new Texture2D(width, height);
-                    result.SetPixels(pix);
-                    result.Apply();
-                    return result;
-                }
-
-                void OnGUI()
-                {
-                    if (!showMenu) return;
-
-                    GUI.Box(menuRect, "FreeFire Aimlock", menuStyle);
-
-                    GUILayout.BeginArea(new Rect(menuRect.x + 10, menuRect.y + 30, menuRect.width - 20, 50));
-                    aimlockEnabled = GUILayout.Toggle(aimlockEnabled, "Aimlock [ON/OFF]", toggleStyle);
-                    if (GUI.changed)
-                    {
-                        AimlockLogic.ToggleAimlock(aimlockEnabled);
-                    }
-                    GUILayout.EndArea();
-
-                    if (GUI.Button(new Rect(menuRect.x + menuRect.width - 35, menuRect.y + 5, 25, 25), "X", closeStyle))
-                    {
-                        showMenu = false;
-                    }
-                }
-
-                void Update()
-                {
-                    if (aimlockEnabled)
-                    {
-                        AimlockLogic.FindEnemyHeads();
-                        AimlockLogic.ApplyAimlock();
-                    }
-
-                    if (Input.GetKeyDown(KeyCode.Escape))
-                    {
-                        showMenu = !showMenu;
-                    }
-                }
-
-                void OnApplicationQuit()
-                {
-                    MemoryReader.CloseProcess();
-                }
-            }
-
-            public class InjectorEntry
-            {
-                public static void Main()
-                {
-                    GameObject go = new GameObject("FreeFireMenu");
-                    go.AddComponent<FreeFireMenu>();
-                    UnityEngine.Object.DontDestroyOnLoad(go);
-                }
-            }
-        }
-        EOF
-
-    - name: Build Dylib
+    - name: Strip Dylib
       run: |
         cd FreeFireAimlock
-        export THEOS=/opt/theos
-        export PATH=/opt/theos/bin:$PATH
-        make
-
-    - name: Package Dylib
-      run: |
-        mkdir -p package
-        cp FreeFireAimlock/.theos/obj/arm64/FreeFireAimlock package/FreeFireAimlock.dylib
-        cd package
-        cat > info.json << 'EOF'
-        {
-          "name": "FreeFireAimlock",
-          "version": "1.0.0",
-          "bundle": "com.dts.freefireth",
-          "entry": "init_freefire_aimlock",
-          "offsets": {
-            "alcChatBubblePos": "0x00080BD5",
-            "adComponentNoFind": "0x000A8771",
-            "boneWeightHead": "0x001D4B8C"
-          }
-        }
-        EOF
-        zip -r ../FreeFireAimlock.zip *
+        strip -S FreeFireAimlock.dylib || true
+        ls -la FreeFireAimlock.dylib
+        file FreeFireAimlock.dylib
+        otool -L FreeFireAimlock.dylib
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: FreeFireAimlock
-        path: FreeFireAimlock.zip
+        path: FreeFireAimlock/FreeFireAimlock.dylib
