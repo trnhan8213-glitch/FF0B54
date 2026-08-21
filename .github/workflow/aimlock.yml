@@ -1,0 +1,389 @@
+name: Build FreeFire Aimlock Dylib
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install Theos
+      run: |
+        sudo git clone --recursive https://github.com/theos/theos.git /opt/theos
+        sudo chown -R $USER /opt/theos
+        echo "export THEOS=/opt/theos" >> $GITHUB_ENV
+        echo "export PATH=/opt/theos/bin:$PATH" >> $GITHUB_ENV
+
+    - name: Install Dependencies
+      run: |
+        brew install ldid dpkg
+        sudo ln -sf /opt/homebrew/bin/ldid /usr/local/bin/ldid || true
+
+    - name: Create Tweak Directory
+      run: |
+        mkdir -p FreeFireAimlock
+        cd FreeFireAimlock
+        echo "export THEOS_MAKE_PATH=$THEOS/makefiles" > Makefile
+        echo "ARCHS = arm64 arm64e" >> Makefile
+        echo "TARGET = iphone:clang:latest:14.0" >> Makefile
+        echo "" >> Makefile
+        echo "include \$(THEOS)/makefiles/common.mk" >> Makefile
+        echo "" >> Makefile
+        echo "TOOL_NAME = FreeFireAimlock" >> Makefile
+        echo "FreeFireAimlock_FILES = main.mm $(wildcard *.cs)" >> Makefile
+        echo "FreeFireAimlock_FRAMEWORKS = UIKit CoreGraphics" >> Makefile
+        echo "FreeFireAimlock_CFLAGS = -fobjc-arc -O2 -std=c++17" >> Makefile
+        echo "FreeFireAimlock_LDFLAGS = -lstdc++ -undefined dynamic_lookup -framework Foundation" >> Makefile
+        echo "" >> Makefile
+        echo "include \$(THEOS)/makefiles/tool.mk" >> Makefile
+
+    - name: Create Objective-C Entry
+      run: |
+        cd FreeFireAimlock
+        cat > main.mm << 'EOF'
+        #import <UIKit/UIKit.h>
+        #import <dlfcn.h>
+        #import <objc/runtime.h>
+        #import <Foundation/Foundation.h>
+
+        extern "C" void MonoInjectEntryPoint();
+
+        __attribute__((constructor)) void init_freefire_aimlock()
+        {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                void *unityHandle = dlopen("/Applications/FreeFire.app/Frameworks/UnityFramework.framework/UnityFramework", RTLD_NOW);
+                if (!unityHandle) return;
+                
+                void *monoHandle = dlopen("/usr/lib/libmonosgen-2.0.dylib", RTLD_NOW);
+                if (!monoHandle) return;
+                
+                void (*mono_thread_attach)(void*) = (void (*)(void*))dlsym(monoHandle, "mono_thread_attach");
+                if (!mono_thread_attach) return;
+                
+                mono_thread_attach(NULL);
+                
+                void *assembly = dlopen(NULL, RTLD_NOW);
+                if (!assembly) return;
+                
+                void (*entry)() = (void (*)())dlsym(assembly, "MonoInjectEntryPoint");
+                if (entry) entry();
+                
+                dlclose(assembly);
+            });
+        }
+
+        extern "C" void MonoInjectEntryPoint()
+        {
+            Class unityAppController = NSClassFromString(@"UnityAppController");
+            if (!unityAppController) return;
+            
+            id controller = [unityAppController performSelector:@selector(sharedInstance)];
+            if (!controller) return;
+            
+            SEL registerSelector = NSSelectorFromString(@"RegisterMonoModule:");
+            if ([controller respondsToSelector:registerSelector])
+            {
+                [controller performSelector:registerSelector withObject:@"FreeFireAimlock"];
+            }
+        }
+        EOF
+
+    - name: Create C# Code File
+      run: |
+        cd FreeFireAimlock
+        cat > FreeFireAimlock.cs << 'EOF'
+        using System;
+        using System.Collections.Generic;
+        using System.Diagnostics;
+        using System.Runtime.InteropServices;
+        using UnityEngine;
+        using UnityEngine.UI;
+
+        namespace FreeFireAimlock
+        {
+            public static class MemoryReader
+            {
+                [DllImport("kernel32.dll")]
+                private static extern IntPtr OpenProcess(int dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+                [DllImport("kernel32.dll")]
+                private static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesRead);
+
+                [DllImport("kernel32.dll")]
+                private static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int dwSize, out IntPtr lpNumberOfBytesWritten);
+
+                [DllImport("kernel32.dll")]
+                private static extern bool CloseHandle(IntPtr hObject);
+
+                private const int PROCESS_VM_READ = 0x0010;
+                private const int PROCESS_VM_WRITE = 0x0020;
+                private const int PROCESS_VM_OPERATION = 0x0008;
+
+                private static IntPtr processHandle = IntPtr.Zero;
+
+                public static bool OpenFreeFireProcess()
+                {
+                    Process[] procs = Process.GetProcessesByName("com.dts.freefireth");
+                    if (procs.Length == 0) return false;
+                    processHandle = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, false, procs[0].Id);
+                    return processHandle != IntPtr.Zero;
+                }
+
+                public static void CloseProcess()
+                {
+                    if (processHandle != IntPtr.Zero) CloseHandle(processHandle);
+                }
+
+                public static byte[] ReadBytes(IntPtr address, int size)
+                {
+                    byte[] buffer = new byte[size];
+                    if (processHandle == IntPtr.Zero) return buffer;
+                    ReadProcessMemory(processHandle, address, buffer, size, out _);
+                    return buffer;
+                }
+
+                public static void WriteBytes(IntPtr address, byte[] data)
+                {
+                    if (processHandle == IntPtr.Zero) return;
+                    WriteProcessMemory(processHandle, address, data, data.Length, out _);
+                }
+
+                public static IntPtr GetModuleBaseAddress(string moduleName)
+                {
+                    Process process = Process.GetProcessById((int)processHandle);
+                    foreach (ProcessModule mod in process.Modules)
+                    {
+                        if (mod.ModuleName.Equals(moduleName, StringComparison.OrdinalIgnoreCase))
+                            return mod.BaseAddress;
+                    }
+                    return IntPtr.Zero;
+                }
+            }
+
+            public static class AimlockOffsets
+            {
+                public const uint BONE_HEAD_FUNC = 0x00080BD5;
+                public const uint BONE_HEAD_COMP = 0x000A8771;
+                public const uint BONE_WEIGHT_HEAD = 0x001D4B8C;
+                public static IntPtr BaseAddress { get; set; }
+
+                public static IntPtr GetBoneHeadPtr()
+                {
+                    if (BaseAddress == IntPtr.Zero) return IntPtr.Zero;
+                    return IntPtr.Add(BaseAddress, (int)BONE_HEAD_FUNC);
+                }
+
+                public static IntPtr GetBoneHeadComponentPtr()
+                {
+                    if (BaseAddress == IntPtr.Zero) return IntPtr.Zero;
+                    return IntPtr.Add(BaseAddress, (int)BONE_HEAD_COMP);
+                }
+
+                public static IntPtr GetBoneWeightHeadPtr()
+                {
+                    if (BaseAddress == IntPtr.Zero) return IntPtr.Zero;
+                    return IntPtr.Add(BaseAddress, (int)BONE_WEIGHT_HEAD);
+                }
+            }
+
+            public static class AimlockLogic
+            {
+                private static bool isAimlockActive = false;
+                private static float aimSmoothness = 5.0f;
+                private static List<IntPtr> enemyHeadPositions = new List<IntPtr>();
+
+                public static void ToggleAimlock(bool enable)
+                {
+                    isAimlockActive = enable;
+                    if (enable) FindEnemyHeads();
+                }
+
+                public static void FindEnemyHeads()
+                {
+                    IntPtr headFuncPtr = AimlockOffsets.GetBoneHeadPtr();
+                    IntPtr headCompPtr = AimlockOffsets.GetBoneHeadComponentPtr();
+                    IntPtr headWeightPtr = AimlockOffsets.GetBoneWeightHeadPtr();
+
+                    byte[] headData = MemoryReader.ReadBytes(headFuncPtr, 4);
+                    IntPtr headAddress = new IntPtr(BitConverter.ToInt32(headData, 0));
+                }
+
+                public static void ApplyAimlock()
+                {
+                    if (!isAimlockActive || enemyHeadPositions.Count == 0) return;
+
+                    Vector3 currentView = Camera.main.transform.forward;
+                    IntPtr closestHead = IntPtr.Zero;
+                    float closestDist = float.MaxValue;
+
+                    foreach (IntPtr headPtr in enemyHeadPositions)
+                    {
+                        byte[] posBytes = MemoryReader.ReadBytes(headPtr, 12);
+                        Vector3 headPos = new Vector3(
+                            BitConverter.ToSingle(posBytes, 0),
+                            BitConverter.ToSingle(posBytes, 4),
+                            BitConverter.ToSingle(posBytes, 8)
+                        );
+
+                        float dist = Vector3.Distance(headPos, Camera.main.transform.position);
+                        if (dist < closestDist)
+                        {
+                            closestDist = dist;
+                            closestHead = headPtr;
+                        }
+                    }
+
+                    if (closestHead != IntPtr.Zero)
+                    {
+                        byte[] finalPos = MemoryReader.ReadBytes(closestHead, 12);
+                        Vector3 targetPos = new Vector3(
+                            BitConverter.ToSingle(finalPos, 0),
+                            BitConverter.ToSingle(finalPos, 4),
+                            BitConverter.ToSingle(finalPos, 8)
+                        );
+
+                        Vector3 lookDir = targetPos - Camera.main.transform.position;
+                        Quaternion targetRot = Quaternion.LookRotation(lookDir);
+                        Camera.main.transform.rotation = Quaternion.Slerp(
+                            Camera.main.transform.rotation,
+                            targetRot,
+                            Time.deltaTime * aimSmoothness
+                        );
+                    }
+                }
+            }
+
+            public class FreeFireMenu : MonoBehaviour
+            {
+                private Rect menuRect = new Rect(20, 60, 220, 120);
+                private bool showMenu = true;
+                private bool aimlockEnabled = false;
+                private GUIStyle menuStyle;
+                private GUIStyle toggleStyle;
+                private GUIStyle closeStyle;
+
+                void Start()
+                {
+                    menuStyle = new GUIStyle(GUI.skin.box);
+                    menuStyle.normal.background = MakeTex(1, 1, new Color(0.15f, 0.15f, 0.18f, 0.95f));
+                    menuStyle.border = new RectOffset(10, 10, 10, 10);
+                    menuStyle.padding = new RectOffset(10, 10, 10, 10);
+
+                    toggleStyle = new GUIStyle(GUI.skin.toggle);
+                    toggleStyle.fontSize = 18;
+                    toggleStyle.normal.textColor = Color.white;
+                    toggleStyle.hover.textColor = Color.cyan;
+
+                    closeStyle = new GUIStyle(GUI.skin.button);
+                    closeStyle.fontSize = 16;
+                    closeStyle.normal.textColor = Color.red;
+                    closeStyle.hover.textColor = Color.white;
+
+                    if (!MemoryReader.OpenFreeFireProcess())
+                    {
+                        Debug.LogError("Khong tim thay tien trinh FreeFire");
+                        return;
+                    }
+
+                    IntPtr baseAddr = MemoryReader.GetModuleBaseAddress("libil2cpp.so");
+                    if (baseAddr != IntPtr.Zero)
+                    {
+                        AimlockOffsets.BaseAddress = baseAddr;
+                    }
+                }
+
+                Texture2D MakeTex(int width, int height, Color col)
+                {
+                    Color[] pix = new Color[width * height];
+                    for (int i = 0; i < pix.Length; i++) pix[i] = col;
+                    Texture2D result = new Texture2D(width, height);
+                    result.SetPixels(pix);
+                    result.Apply();
+                    return result;
+                }
+
+                void OnGUI()
+                {
+                    if (!showMenu) return;
+
+                    GUI.Box(menuRect, "FreeFire Aimlock", menuStyle);
+
+                    GUILayout.BeginArea(new Rect(menuRect.x + 10, menuRect.y + 30, menuRect.width - 20, 50));
+                    aimlockEnabled = GUILayout.Toggle(aimlockEnabled, "Aimlock [ON/OFF]", toggleStyle);
+                    if (GUI.changed)
+                    {
+                        AimlockLogic.ToggleAimlock(aimlockEnabled);
+                    }
+                    GUILayout.EndArea();
+
+                    if (GUI.Button(new Rect(menuRect.x + menuRect.width - 35, menuRect.y + 5, 25, 25), "X", closeStyle))
+                    {
+                        showMenu = false;
+                    }
+                }
+
+                void Update()
+                {
+                    if (aimlockEnabled)
+                    {
+                        AimlockLogic.FindEnemyHeads();
+                        AimlockLogic.ApplyAimlock();
+                    }
+
+                    if (Input.GetKeyDown(KeyCode.Escape))
+                    {
+                        showMenu = !showMenu;
+                    }
+                }
+
+                void OnApplicationQuit()
+                {
+                    MemoryReader.CloseProcess();
+                }
+            }
+
+            public class InjectorEntry
+            {
+                public static void Main()
+                {
+                    GameObject go = new GameObject("FreeFireMenu");
+                    go.AddComponent<FreeFireMenu>();
+                    UnityEngine.Object.DontDestroyOnLoad(go);
+                }
+            }
+        }
+        EOF
+
+    - name: Build Dylib
+      run: |
+        cd FreeFireAimlock
+        export THEOS=/opt/theos
+        export PATH=/opt/theos/bin:$PATH
+        make
+
+    - name: Package Dylib
+      run: |
+        mkdir -p package
+        cp FreeFireAimlock/.theos/obj/arm64/FreeFireAimlock package/FreeFireAimlock.dylib
+        cd package
+        cat > info.json << 'EOF'
+        {
+          "name": "FreeFireAimlock",
+          "version": "1.0.0",
+          "bundle": "com.dts.freefireth",
+          "entry": "init_freefire_aimlock"
+        }
+        EOF
+        zip -r ../FreeFireAimlock.zip *
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: FreeFireAimlock
+        path: FreeFireAimlock.zip
